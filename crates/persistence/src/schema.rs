@@ -360,6 +360,7 @@ diesel::table! {
         window_id -> Integer,
         custom_title -> Nullable<Text>,
         color -> Nullable<Text>,
+        tab_group_override -> Nullable<Text>,
     }
 }
 

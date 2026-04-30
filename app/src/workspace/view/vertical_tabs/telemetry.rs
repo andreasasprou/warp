@@ -61,6 +61,25 @@ impl VerticalTabsDisplayOption {
     }
 }
 
+/// Where the user invoked a tab-group action.
+///
+/// The MVP only exposes group creation/assignment via the right-click context
+/// menu. v2 will add a panel-header affordance; when that lands, add a
+/// `PanelHeader` variant here and map it in `serialized`.
+#[derive(Clone, Copy, Debug)]
+pub enum TabGroupActionSource {
+    /// Triggered from the per-tab right-click context menu.
+    ContextMenu,
+}
+
+impl TabGroupActionSource {
+    fn serialized(&self) -> &'static str {
+        match self {
+            Self::ContextMenu => "context_menu",
+        }
+    }
+}
+
 /// Where in the vertical tabs UI a clickable diff-stats or GitHub PR chip
 /// was rendered when the user clicked it.
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +117,14 @@ pub enum VerticalTabsTelemetryEvent {
     PrChipClicked {
         entrypoint: VerticalTabsChipEntrypoint,
     },
+    /// The user created a new tab group.
+    TabGroupCreated { source: TabGroupActionSource },
+    /// The user assigned a tab's directory to a group.
+    TabAssignedToGroup { source: TabGroupActionSource },
+    /// The user excluded a tab's directory from groups.
+    TabExcludedFromGroups,
+    /// The user toggled a tab group's collapsed state in the sidebar.
+    TabGroupCollapsedToggled { collapsed: bool },
 }
 
 impl TelemetryEvent for VerticalTabsTelemetryEvent {
@@ -116,6 +143,16 @@ impl TelemetryEvent for VerticalTabsTelemetryEvent {
             })),
             Self::PrChipClicked { entrypoint } => Some(json!({
                 "entrypoint": entrypoint.serialized(),
+            })),
+            Self::TabGroupCreated { source } => Some(json!({
+                "source": source.serialized(),
+            })),
+            Self::TabAssignedToGroup { source } => Some(json!({
+                "source": source.serialized(),
+            })),
+            Self::TabExcludedFromGroups => None,
+            Self::TabGroupCollapsedToggled { collapsed } => Some(json!({
+                "collapsed": collapsed,
             })),
         }
     }
@@ -143,6 +180,10 @@ impl TelemetryEventDesc for VerticalTabsTelemetryEventDiscriminants {
             Self::DisplayOptionChanged => "VerticalTabs.DisplayOptionChanged",
             Self::DiffStatsChipClicked => "VerticalTabs.DiffStatsChipClicked",
             Self::PrChipClicked => "VerticalTabs.PrChipClicked",
+            Self::TabGroupCreated => "VerticalTabs.TabGroupCreated",
+            Self::TabAssignedToGroup => "VerticalTabs.TabAssignedToGroup",
+            Self::TabExcludedFromGroups => "VerticalTabs.TabExcludedFromGroups",
+            Self::TabGroupCollapsedToggled => "VerticalTabs.TabGroupCollapsedToggled",
         }
     }
 
@@ -157,11 +198,21 @@ impl TelemetryEventDesc for VerticalTabsTelemetryEventDiscriminants {
             Self::PrChipClicked => {
                 "User clicked a GitHub PR chip in the vertical tabs panel or detail sidecar"
             }
+            Self::TabGroupCreated => "User created a new tab group in the vertical tabs panel",
+            Self::TabAssignedToGroup => "User assigned a tab's directory to a tab group",
+            Self::TabExcludedFromGroups => "User excluded a tab's directory from all tab groups",
+            Self::TabGroupCollapsedToggled => "User toggled a tab group's collapsed state",
         }
     }
 
     fn enablement_state(&self) -> EnablementState {
-        EnablementState::Flag(FeatureFlag::VerticalTabs)
+        match self {
+            Self::TabGroupCreated
+            | Self::TabAssignedToGroup
+            | Self::TabExcludedFromGroups
+            | Self::TabGroupCollapsedToggled => EnablementState::Flag(FeatureFlag::TabGroups),
+            _ => EnablementState::Flag(FeatureFlag::VerticalTabs),
+        }
     }
 }
 

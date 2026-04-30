@@ -16,6 +16,7 @@ use crate::{
     tab::SelectedTabColor,
     terminal::model::block::SerializedBlock,
     terminal::ShellLaunchData,
+    workspace::tab_settings::TabGroupId,
 };
 
 use super::{
@@ -137,6 +138,7 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
             }),
             default_directory_color: None,
             selected_color: SelectedTabColor::default(),
+            tab_group_override: None,
             left_panel: None,
             right_panel: None,
         }],
@@ -154,6 +156,33 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
         right_panel_width: None,
         agent_management_filters: None,
     }
+}
+
+#[test]
+fn test_sqlite_round_trips_tab_group_override() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let database_path = tempdir.path().join("warp.sqlite");
+    let mut conn = setup_database(&database_path).expect("database should initialize");
+
+    let mut app_state = AppState {
+        windows: vec![test_terminal_window_snapshot(false)],
+        active_window_index: Some(0),
+        block_lists: Default::default(),
+        running_mcp_servers: Default::default(),
+    };
+    app_state.windows[0].tabs[0].tab_group_override =
+        Some(TabGroupId("manual-home-tab-group".to_string()));
+
+    save_app_state(&mut conn, &app_state).expect("app state should save");
+
+    let restored = read_sqlite_data(&mut conn, None)
+        .expect("app state should load")
+        .app_state;
+
+    assert_eq!(
+        restored.windows[0].tabs[0].tab_group_override,
+        Some(TabGroupId("manual-home-tab-group".to_string()))
+    );
 }
 
 #[test]
@@ -220,6 +249,7 @@ fn test_sqlite_round_trips_custom_vertical_tabs_title() {
                 }),
                 default_directory_color: None,
                 selected_color: SelectedTabColor::default(),
+                tab_group_override: None,
                 left_panel: None,
                 right_panel: None,
             }],
@@ -292,6 +322,7 @@ fn test_sqlite_round_trips_code_pane_with_multiple_tabs() {
                 }),
                 default_directory_color: None,
                 selected_color: SelectedTabColor::default(),
+                tab_group_override: None,
                 left_panel: None,
                 right_panel: None,
             }],

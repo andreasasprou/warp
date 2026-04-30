@@ -15,7 +15,7 @@ mod startup_directory;
 #[cfg(test)]
 #[path = "view_test.rs"]
 mod tests;
-mod vertical_tabs;
+pub(crate) mod vertical_tabs;
 #[cfg(target_family = "wasm")]
 mod wasm_view;
 
@@ -927,6 +927,17 @@ pub struct Workspace {
     reward_modal_pending: Option<RewardKind>,
     current_workspace_state: WorkspaceState,
     previous_workspace_state: Option<WorkspaceState>,
+    /// Popup menu attached to the three-dot button on each tab-group header.
+    /// Items are populated dynamically when opened.
+    tab_group_header_menu: ViewHandle<Menu<WorkspaceAction>>,
+    /// `(group id, click position)` when a group header's three-dot menu is
+    /// open. Used for positioning the popup.
+    show_tab_group_header_menu: Option<(crate::workspace::tab_settings::TabGroupId, Vector2F)>,
+    /// Inline editor used when renaming a tab group via the header menu.
+    tab_group_rename_editor: ViewHandle<EditorView>,
+    /// Group currently being renamed (the header renders the editor in
+    /// place of the title text while this is set).
+    renaming_tab_group: Option<crate::workspace::tab_settings::TabGroupId>,
     welcome_tips_view_state: WelcomeTipsViewState,
     welcome_tips_view: ViewHandle<TipsView>,
     model_event_sender: Option<mpsc::SyncSender<ModelEvent>>,
@@ -1243,6 +1254,26 @@ impl Workspace {
         };
         ctx.subscribe_to_view(&editor, move |me, _, event, ctx| {
             me.handle_tab_rename_editor_event(event, ctx);
+        });
+        editor
+    }
+
+    fn tab_group_rename_editor(ctx: &mut ViewContext<Self>) -> ViewHandle<EditorView> {
+        let editor = {
+            ctx.add_typed_action_view(|ctx| {
+                let appearance = Appearance::as_ref(ctx);
+                let options = SingleLineEditorOptions {
+                    text: TextOptions::ui_text(
+                        Some(Self::tab_rename_editor_font_size(ctx, appearance)),
+                        appearance,
+                    ),
+                    ..Default::default()
+                };
+                EditorView::single_line(options, ctx)
+            })
+        };
+        ctx.subscribe_to_view(&editor, move |me, _, event, ctx| {
+            me.handle_tab_group_rename_editor_event(event, ctx);
         });
         editor
     }
@@ -1739,6 +1770,16 @@ impl Workspace {
             me.handle_tab_bar_overflow_menu_event(event, ctx);
         });
         tab_bar_overflow_menu
+    }
+
+    fn build_tab_group_header_menu(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Menu<WorkspaceAction>> {
+        let menu = ctx.add_typed_action_view(|_| Menu::new());
+        ctx.subscribe_to_view(&menu, move |me, _, event, ctx| {
+            me.handle_tab_group_header_menu_event(event, ctx);
+        });
+        menu
     }
 
     fn build_menus(ctx: &mut ViewContext<Self>) -> WorkspaceMenuHandles {
@@ -3040,6 +3081,10 @@ impl Workspace {
             tab_bar_hover_state: Default::default(),
             traffic_light_mouse_states: Default::default(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
+            tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
+            renaming_tab_group: None,
+            tab_group_header_menu: Self::build_tab_group_header_menu(ctx),
+            show_tab_group_header_menu: None,
             pane_rename_editor: Self::pane_rename_editor(ctx),
             vertical_tabs_search_input: Self::vertical_tabs_search_input(ctx),
             tips_completed,
@@ -3492,6 +3537,10 @@ impl Workspace {
                 self.sync_panel_positions_from_config(ctx);
                 ctx.notify();
             }
+            TabSettingsChangedEvent::TabGroups { .. }
+            | TabSettingsChangedEvent::TabGroupAssignments { .. } => {
+                ctx.notify();
+            }
         }
     }
 
@@ -3569,6 +3618,8 @@ impl Workspace {
                         self.tabs[tab_index].default_directory_color =
                             saved_tab.default_directory_color;
                         self.tabs[tab_index].selected_color = saved_tab.selected_color;
+                        self.tabs[tab_index].tab_group_override =
+                            saved_tab.tab_group_override.clone();
 
                         let pane_group = self.tabs[tab_index].pane_group.clone();
 
@@ -6033,7 +6084,7 @@ impl Workspace {
     /// Builds the unified new-session menu items
     /// tab bar chevron and the vertical tab bar `+` button.
     ///
-    /// Order: Agent → Terminal (sidecar) → Cloud Oz → [tab configs] → separator → New worktree config (sidecar) → New tab config → separator → Reopen closed session.
+    /// Order: Agent → Terminal (sidecar) → Cloud Oz → [tab configs] → separator → New worktree config (sidecar) → New tab config → New tab group → separator → Reopen closed session.
     fn unified_new_session_menu_items(
         &self,
         ctx: &mut ViewContext<Self>,
@@ -6202,6 +6253,26 @@ impl Workspace {
                     .with_on_select_action(WorkspaceAction::SelectNewSessionMenuItem(
                         NewSessionMenuItem::CreateNewTabConfig,
                     ))
+                    .with_icon(icons::Icon::Plus)
+                    .into_item(),
+            );
+        }
+
+        // 7. New tab group: flag-gated MVP affordance. Seeds from the active
+        // tab so a fresh group auto-claims the active tab's project root when
+        // a git repo is detected. Broad directories, like the user's home,
+        // use a per-tab override instead of a directory assignment.
+        if FeatureFlag::TabGroups.is_enabled() {
+            let active_tab = self.tabs.get(self.active_tab_index);
+            let default_name = active_tab
+                .map(|tab| crate::tab::default_group_name_for_seed(tab, ctx))
+                .unwrap_or_else(|| "New group".to_string());
+            menu_items.push(
+                MenuItemFields::new("New tab group")
+                    .with_on_select_action(WorkspaceAction::CreateTabGroup {
+                        name: default_name,
+                        seed_tab_index: Some(self.active_tab_index),
+                    })
                     .with_icon(icons::Icon::Plus)
                     .into_item(),
             );
@@ -9861,6 +9932,10 @@ impl Workspace {
                         .tabs
                         .get(tab_index)
                         .map_or(SelectedTabColor::Unset, |tab| tab.selected_color),
+                    tab_group_override: self
+                        .tabs
+                        .get(tab_index)
+                        .and_then(|tab| tab.tab_group_override.clone()),
                     left_panel,
                     right_panel,
                 }
@@ -12011,6 +12086,576 @@ impl Workspace {
             send_telemetry_from_ctx!(TelemetryEvent::MoveTab { direction }, ctx);
         }
 
+        ctx.notify();
+    }
+
+    /// Toggle a tab group's collapsed flag and persist via TabSettings.
+    fn set_tab_group_collapsed(
+        &mut self,
+        id: &crate::workspace::tab_settings::TabGroupId,
+        collapsed: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            let updated = settings.tab_groups.value().with_collapsed(id, collapsed);
+            let _ = settings.tab_groups.set_value(updated, ctx);
+        });
+        send_telemetry_from_ctx!(
+            VerticalTabsTelemetryEvent::TabGroupCollapsedToggled { collapsed },
+            ctx
+        );
+        ctx.notify();
+    }
+
+    /// Assign a tab to a group. Safe project directories use the directory
+    /// assignment map so sibling tabs auto-join. Broad or unavailable
+    /// directories use a per-tab override persisted with the workspace
+    /// snapshot, so moving a home-directory tab does not capture every shell.
+    fn assign_tab_directory_to_group(
+        &mut self,
+        tab_index: usize,
+        group: &crate::workspace::tab_settings::TabGroupId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::workspace::tab_settings::TabGroupAssignment;
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+
+        let safe_dir = crate::workspace::view::vertical_tabs::tab_directory_for_grouping(tab, ctx)
+            .filter(|dir| {
+                !crate::workspace::view::vertical_tabs::is_too_broad_for_group_assignment(dir)
+            });
+
+        if let Some(dir) = safe_dir {
+            if let Some(tab) = self.tabs.get_mut(tab_index) {
+                tab.tab_group_override = None;
+            }
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                let updated = settings
+                    .tab_group_assignments
+                    .value()
+                    .with_assignment(&dir, TabGroupAssignment::InGroup(group.clone()));
+                let _ = settings.tab_group_assignments.set_value(updated, ctx);
+            });
+        } else if let Some(tab) = self.tabs.get_mut(tab_index) {
+            tab.tab_group_override = Some(group.clone());
+        }
+
+        send_telemetry_from_ctx!(
+            VerticalTabsTelemetryEvent::TabAssignedToGroup {
+                source: crate::workspace::view::vertical_tabs::telemetry::TabGroupActionSource::ContextMenu,
+            },
+            ctx
+        );
+        ctx.notify();
+    }
+
+    /// Create a new tab group named `name`. If a seed tab has a safe project
+    /// directory, write that directory into `TabGroupAssignments` so sibling
+    /// tabs auto-join. Otherwise attach only the seed tab via a persisted
+    /// per-tab override.
+    fn create_tab_group(
+        &mut self,
+        name: &str,
+        seed_tab_index: Option<usize>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::workspace::tab_settings::{TabGroup, TabGroupAssignment, TabGroupId};
+
+        let id = TabGroupId::new();
+        let seed_dir = seed_tab_index
+            .and_then(|idx| self.tabs.get(idx))
+            .and_then(|tab| {
+                crate::workspace::view::vertical_tabs::tab_directory_for_grouping(tab, ctx)
+            });
+
+        // If the seed lives inside a git repo, prefer the repo root as the
+        // assignment key. That way new shells anywhere under the same project
+        // auto-join the group, which is the user's expectation. Refuse to use
+        // the home dir (or shallower) as a key; it would capture every default
+        // shell. In that case the seed tab gets a per-tab override instead.
+        let assignment_key = seed_dir.as_ref().and_then(|dir| {
+            let key = git2::Repository::discover(dir)
+                .ok()
+                .and_then(|repo| repo.workdir().map(std::path::Path::to_path_buf))
+                .unwrap_or_else(|| dir.clone());
+            (!crate::workspace::view::vertical_tabs::is_too_broad_for_group_assignment(&key))
+                .then_some(key)
+        });
+        let has_assignment_key = assignment_key.is_some();
+
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            let updated = settings.tab_groups.value().with_added(TabGroup {
+                id: id.clone(),
+                name: name.to_string(),
+                color: None,
+                collapsed: false,
+            });
+            let _ = settings.tab_groups.set_value(updated, ctx);
+
+            if let Some(key) = assignment_key.as_deref() {
+                let updated_assignments = settings
+                    .tab_group_assignments
+                    .value()
+                    .with_assignment(key, TabGroupAssignment::InGroup(id.clone()));
+                let _ = settings
+                    .tab_group_assignments
+                    .set_value(updated_assignments, ctx);
+            }
+        });
+
+        if let Some(seed_tab_index) = seed_tab_index {
+            if let Some(tab) = self.tabs.get_mut(seed_tab_index) {
+                tab.tab_group_override = (!has_assignment_key).then_some(id.clone());
+            }
+        }
+
+        send_telemetry_from_ctx!(
+            VerticalTabsTelemetryEvent::TabGroupCreated {
+                source: crate::workspace::view::vertical_tabs::telemetry::TabGroupActionSource::ContextMenu,
+            },
+            ctx
+        );
+        ctx.notify();
+    }
+
+    /// Remove a tab from its group. Per-tab membership is cleared directly;
+    /// directory membership writes `Excluded` for the resolved directory.
+    fn remove_tab_from_group(&mut self, tab_index: usize, ctx: &mut ViewContext<Self>) {
+        use crate::workspace::tab_settings::TabGroupAssignment;
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+
+        if tab.tab_group_override.is_some() {
+            if let Some(tab) = self.tabs.get_mut(tab_index) {
+                tab.tab_group_override = None;
+            }
+            send_telemetry_from_ctx!(VerticalTabsTelemetryEvent::TabExcludedFromGroups, ctx);
+            ctx.notify();
+            return;
+        }
+
+        let dir = crate::workspace::view::vertical_tabs::tab_directory_for_grouping(tab, ctx);
+        if let Some(dir) = dir.as_deref() {
+            // Only write `Excluded` when the directory currently resolves
+            // into a group; otherwise it'd be a needless no-op entry. And
+            // skip when the dir is too broad (home dir guard) for the same
+            // reason `assign_tab_directory_to_group` does.
+            if !crate::workspace::view::vertical_tabs::is_too_broad_for_group_assignment(dir) {
+                let still_in_group = TabSettings::as_ref(ctx)
+                    .tab_group_assignments
+                    .value()
+                    .group_for_directory(dir)
+                    .is_some();
+                if still_in_group {
+                    TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        let updated = settings
+                            .tab_group_assignments
+                            .value()
+                            .with_assignment(dir, TabGroupAssignment::Excluded);
+                        let _ = settings.tab_group_assignments.set_value(updated, ctx);
+                    });
+                }
+            }
+        }
+
+        send_telemetry_from_ctx!(VerticalTabsTelemetryEvent::TabExcludedFromGroups, ctx);
+        ctx.notify();
+    }
+
+    /// Rename an existing tab group. Silently no-ops if the id is unknown.
+    fn rename_tab_group(
+        &mut self,
+        id: &crate::workspace::tab_settings::TabGroupId,
+        new_name: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            let current = settings.tab_groups.value();
+            let updated_groups: Vec<_> = current
+                .iter()
+                .map(|g| {
+                    if &g.id == id {
+                        crate::workspace::tab_settings::TabGroup {
+                            name: trimmed.to_string(),
+                            ..g.clone()
+                        }
+                    } else {
+                        g.clone()
+                    }
+                })
+                .collect();
+            let _ = settings.tab_groups.set_value(
+                crate::workspace::tab_settings::TabGroups(updated_groups),
+                ctx,
+            );
+        });
+        ctx.notify();
+    }
+
+    /// Move a group up (`delta = -1`) or down (`delta = 1`) in the ordered list.
+    fn move_tab_group(
+        &mut self,
+        id: &crate::workspace::tab_settings::TabGroupId,
+        delta: i32,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::workspace::tab_settings::TabGroupId;
+
+        #[derive(Clone)]
+        enum VisualItem {
+            Tab { index: usize },
+            Group { id: TabGroupId, indices: Vec<usize> },
+        }
+
+        let tab_groups = TabSettings::as_ref(ctx).tab_groups.value().clone();
+        let assignments = TabSettings::as_ref(ctx)
+            .tab_group_assignments
+            .value()
+            .clone();
+        let resolved_groups: Vec<Option<TabGroupId>> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                tab.tab_group_override.clone().or_else(|| {
+                    crate::workspace::view::vertical_tabs::tab_directory_for_grouping(tab, ctx)
+                        .as_deref()
+                        .and_then(|dir| assignments.group_for_directory(dir))
+                })
+            })
+            .map(|group_id| group_id.filter(|group_id| tab_groups.contains(group_id)))
+            .collect();
+
+        let group_indices: Vec<usize> = resolved_groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group_id)| (group_id.as_ref() == Some(id)).then_some(index))
+            .collect();
+
+        // Empty groups have no tab block to move in `Workspace.tabs`; their
+        // relative order is still represented by `TabGroups`.
+        if !group_indices.is_empty() {
+            let mut seen_groups = std::collections::HashSet::new();
+            let mut visual_items = Vec::new();
+            for (index, group_id) in resolved_groups.iter().enumerate() {
+                if let Some(group_id) = group_id {
+                    if seen_groups.insert(group_id.clone()) {
+                        let indices = resolved_groups
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(candidate_index, candidate_group_id)| {
+                                (candidate_group_id.as_ref() == Some(group_id))
+                                    .then_some(candidate_index)
+                            })
+                            .collect();
+                        visual_items.push(VisualItem::Group {
+                            id: group_id.clone(),
+                            indices,
+                        });
+                    }
+                } else {
+                    visual_items.push(VisualItem::Tab { index });
+                }
+            }
+
+            let Some(pos) = visual_items.iter().position(
+                |item| matches!(item, VisualItem::Group { id: group_id, .. } if group_id == id),
+            ) else {
+                return;
+            };
+            let new_pos = pos as i32 + delta;
+            if new_pos >= 0 && new_pos < visual_items.len() as i32 {
+                let target = visual_items[new_pos as usize].clone();
+                let target_indices = match target {
+                    VisualItem::Tab { index } => vec![index],
+                    VisualItem::Group { indices, .. } => indices,
+                };
+                if !target_indices.is_empty() {
+                    let active_pane_group_id = self
+                        .tabs
+                        .get(self.active_tab_index)
+                        .map(|tab| tab.pane_group.id());
+                    let moving_index_set: std::collections::HashSet<_> =
+                        group_indices.iter().copied().collect();
+                    let mut moving_tabs = Vec::new();
+                    let mut remaining_tabs = Vec::new();
+                    for (index, tab) in self.tabs.drain(..).enumerate() {
+                        if moving_index_set.contains(&index) {
+                            moving_tabs.push(tab);
+                        } else {
+                            remaining_tabs.push((index, tab));
+                        }
+                    }
+
+                    let insertion_index = if delta < 0 {
+                        let target_first = *target_indices.iter().min().unwrap();
+                        remaining_tabs
+                            .iter()
+                            .position(|(index, _)| *index == target_first)
+                            .unwrap_or(0)
+                    } else {
+                        let target_last = *target_indices.iter().max().unwrap();
+                        remaining_tabs
+                            .iter()
+                            .position(|(index, _)| *index == target_last)
+                            .map(|index| index + 1)
+                            .unwrap_or(remaining_tabs.len())
+                    };
+
+                    let mut reordered: Vec<_> =
+                        remaining_tabs.into_iter().map(|(_, tab)| tab).collect();
+                    for (offset, tab) in moving_tabs.into_iter().enumerate() {
+                        reordered.insert(insertion_index + offset, tab);
+                    }
+                    self.tabs = reordered;
+
+                    if let Some(active_pane_group_id) = active_pane_group_id {
+                        if let Some(active_index) = self
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.pane_group.id() == active_pane_group_id)
+                        {
+                            self.set_active_tab_index(active_index, ctx);
+                        }
+                    }
+                    ctx.notify();
+                    return;
+                }
+            }
+        }
+
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            let mut groups = settings.tab_groups.value().0.clone();
+            let Some(pos) = groups.iter().position(|g| &g.id == id) else {
+                return;
+            };
+            let new_pos = pos as i32 + delta;
+            if new_pos < 0 || new_pos >= groups.len() as i32 {
+                return;
+            }
+            groups.swap(pos, new_pos as usize);
+            let _ = settings
+                .tab_groups
+                .set_value(crate::workspace::tab_settings::TabGroups(groups), ctx);
+        });
+        ctx.notify();
+    }
+
+    /// The tab-group currently being renamed (header swaps title for the
+    /// inline rename editor while this is `Some`).
+    pub fn renaming_tab_group(&self) -> Option<&crate::workspace::tab_settings::TabGroupId> {
+        self.renaming_tab_group.as_ref()
+    }
+
+    /// Handle to the inline tab-group rename editor.
+    pub fn tab_group_rename_editor_handle(&self) -> &ViewHandle<EditorView> {
+        &self.tab_group_rename_editor
+    }
+
+    /// Toggle the popup menu attached to a tab-group header's three-dot
+    /// button. Mutually exclusive with the tab right-click menu.
+    fn toggle_tab_group_header_menu(
+        &mut self,
+        id: crate::workspace::tab_settings::TabGroupId,
+        position: Vector2F,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // If a different popup is already open, close it first.
+        self.show_tab_right_click_menu = None;
+        if self
+            .show_tab_group_header_menu
+            .as_ref()
+            .map(|(open_id, _)| open_id == &id)
+            .unwrap_or(false)
+        {
+            self.show_tab_group_header_menu = None;
+            ctx.notify();
+            return;
+        }
+
+        let menu_items = self.tab_group_header_menu_items(&id, ctx);
+        ctx.update_view(&self.tab_group_header_menu, |context_menu, view_ctx| {
+            context_menu.set_items(menu_items, view_ctx);
+        });
+        self.show_tab_group_header_menu = Some((id, position));
+        ctx.focus(&self.tab_group_header_menu);
+        ctx.notify();
+    }
+
+    /// Build the menu items shown in a tab-group header's three-dot popup.
+    fn tab_group_header_menu_items(
+        &self,
+        id: &crate::workspace::tab_settings::TabGroupId,
+        ctx: &AppContext,
+    ) -> Vec<crate::menu::MenuItem<WorkspaceAction>> {
+        use crate::menu::{MenuItem, MenuItemFields};
+
+        let groups = TabSettings::as_ref(ctx).tab_groups.value();
+        let pos = groups.iter().position(|g| &g.id == id);
+        let last_index = groups.0.len().saturating_sub(1);
+
+        let mut items: Vec<MenuItem<WorkspaceAction>> = Vec::new();
+        items.push(
+            MenuItemFields::new("Rename group")
+                .with_on_select_action(WorkspaceAction::StartRenameTabGroup { id: id.clone() })
+                .into_item(),
+        );
+
+        // Build the move section first; only emit a separator + the items
+        // when at least one move action applies. With a single group both
+        // moves are hidden. Without this guard we'd emit two consecutive
+        // separators (the "double border" UI bug).
+        let mut move_items: Vec<MenuItem<WorkspaceAction>> = Vec::new();
+        if pos.map(|p| p > 0).unwrap_or(false) {
+            move_items.push(
+                MenuItemFields::new("Move group up")
+                    .with_on_select_action(WorkspaceAction::MoveTabGroupUp { id: id.clone() })
+                    .into_item(),
+            );
+        }
+        if pos.map(|p| p < last_index).unwrap_or(false) {
+            move_items.push(
+                MenuItemFields::new("Move group down")
+                    .with_on_select_action(WorkspaceAction::MoveTabGroupDown { id: id.clone() })
+                    .into_item(),
+            );
+        }
+        if !move_items.is_empty() {
+            items.push(MenuItem::Separator);
+            items.extend(move_items);
+        }
+
+        items.push(MenuItem::Separator);
+        items.push(
+            MenuItemFields::new("Delete group")
+                .with_on_select_action(WorkspaceAction::DeleteTabGroup { id: id.clone() })
+                .into_item(),
+        );
+        items
+    }
+
+    /// Begin inline rename of a tab group: pre-fill the rename editor with
+    /// the group's current name and focus it. The rendering code swaps the
+    /// header title for the editor while `renaming_tab_group` is set.
+    fn start_rename_tab_group(
+        &mut self,
+        id: crate::workspace::tab_settings::TabGroupId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Close any open header menu because the user just selected an item from it.
+        self.show_tab_group_header_menu = None;
+
+        let current_name = TabSettings::as_ref(ctx)
+            .tab_groups
+            .value()
+            .get(&id)
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+
+        // Mirror the existing tab-rename pattern: clear, then insert the
+        // current name as selected text so the user can immediately type to
+        // overwrite or commit-as-is via Enter.
+        self.tab_group_rename_editor.update(ctx, |editor, ctx| {
+            editor.delete(ctx);
+            editor.insert_selected_text(&current_name, ctx);
+        });
+        self.renaming_tab_group = Some(id);
+        ctx.focus(&self.tab_group_rename_editor);
+        ctx.notify();
+    }
+
+    /// Editor event handler for the inline tab-group rename.
+    /// On Enter or Blur: commit the new name. On Escape: cancel.
+    pub fn handle_tab_group_rename_editor_event(
+        &mut self,
+        event: &EditorEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(id) = self.renaming_tab_group.clone() else {
+            return;
+        };
+        match event {
+            EditorEvent::Blurred | EditorEvent::Enter => {
+                let new_name = self.tab_group_rename_editor.as_ref(ctx).buffer_text(ctx);
+                self.renaming_tab_group = None;
+                if !new_name.trim().is_empty() {
+                    self.rename_tab_group(&id, &new_name, ctx);
+                }
+                ctx.notify();
+            }
+            EditorEvent::Escape => {
+                self.renaming_tab_group = None;
+                ctx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// Menu event handler for the tab-group header popup. We just close the
+    /// menu when an item is selected; item dispatch happens in the menu
+    /// infrastructure.
+    pub fn handle_tab_group_header_menu_event(
+        &mut self,
+        event: &MenuEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            MenuEvent::Close { .. } | MenuEvent::ItemSelected => {
+                self.show_tab_group_header_menu = None;
+                ctx.notify();
+            }
+            MenuEvent::ItemHovered => {}
+        }
+    }
+
+    /// Delete a tab group. Cleans up:
+    ///  - the `TabGroup` entry in `tab_groups`
+    ///  - all `tab_group_assignments` pointing at the deleted id
+    ///  - all per-tab overrides pointing at the deleted id
+    ///
+    /// Tabs that were in the group naturally fall back to ungrouped on next render.
+    fn delete_tab_group(
+        &mut self,
+        id: &crate::workspace::tab_settings::TabGroupId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            // Remove the group definition.
+            let new_groups: Vec<_> = settings
+                .tab_groups
+                .value()
+                .iter()
+                .filter(|g| &g.id != id)
+                .cloned()
+                .collect();
+            let _ = settings
+                .tab_groups
+                .set_value(crate::workspace::tab_settings::TabGroups(new_groups), ctx);
+
+            // Strip any directory assignments pointing at the deleted id.
+            let mut assigns_map = settings.tab_group_assignments.value().0.clone();
+            assigns_map.retain(|_, assignment| {
+                !matches!(
+                    assignment,
+                    crate::workspace::tab_settings::TabGroupAssignment::InGroup(gid) if gid == id
+                )
+            });
+            let _ = settings.tab_group_assignments.set_value(
+                crate::workspace::tab_settings::TabGroupAssignments(assigns_map),
+                ctx,
+            );
+        });
+        for tab in &mut self.tabs {
+            if tab.tab_group_override.as_ref() == Some(id) {
+                tab.tab_group_override = None;
+            }
+        }
         ctx.notify();
     }
 
@@ -21719,6 +22364,39 @@ impl TypedActionView for Workspace {
             HandoffPendingTransfer { .. } => {}
             ReverseHandoff { .. } => {}
             FinalizeDropTab => {}
+            SetTabGroupCollapsed { id, collapsed } => {
+                self.set_tab_group_collapsed(id, *collapsed, ctx);
+            }
+            AssignTabDirectoryToGroup { tab_index, group } => {
+                self.assign_tab_directory_to_group(*tab_index, group, ctx);
+            }
+            CreateTabGroup {
+                name,
+                seed_tab_index,
+            } => {
+                self.create_tab_group(name, *seed_tab_index, ctx);
+            }
+            RemoveTabFromGroup { tab_index } => {
+                self.remove_tab_from_group(*tab_index, ctx);
+            }
+            RenameTabGroup { id, new_name } => {
+                self.rename_tab_group(id, new_name, ctx);
+            }
+            MoveTabGroupUp { id } => {
+                self.move_tab_group(id, -1, ctx);
+            }
+            MoveTabGroupDown { id } => {
+                self.move_tab_group(id, 1, ctx);
+            }
+            DeleteTabGroup { id } => {
+                self.delete_tab_group(id, ctx);
+            }
+            ToggleTabGroupHeaderMenu { id, position } => {
+                self.toggle_tab_group_header_menu(id.clone(), *position, ctx);
+            }
+            StartRenameTabGroup { id } => {
+                self.start_rename_tab_group(id.clone(), ctx);
+            }
             SyncTrafficLights => {
                 self.sync_window_button_visibility(ctx);
             }
@@ -22194,6 +22872,18 @@ impl View for Workspace {
                 ChildView::new(&self.header_toolbar_context_menu).finish(),
                 OffsetPositioning::offset_from_parent(
                     position,
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        }
+
+        if let Some((_id, position)) = &self.show_tab_group_header_menu {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.tab_group_header_menu).finish(),
+                OffsetPositioning::offset_from_parent(
+                    *position,
                     ParentOffsetBounds::WindowByPosition,
                     ParentAnchor::TopLeft,
                     ChildAnchor::TopLeft,

@@ -1,3 +1,4 @@
+pub mod grouping;
 pub mod telemetry;
 
 use crate::ai::agent::conversation::ConversationStatus;
@@ -132,6 +133,66 @@ const VERTICAL_TABS_AGENT_SIZING: IconWithStatusSizing = IconWithStatusSizing {
 
 fn vtab_pane_row_position_id(pane_group_id: EntityId, pane_id: PaneId) -> String {
     format!("vertical_tabs:pane_row:{pane_group_id:?}:{pane_id}")
+}
+
+/// Resolves the directory used for tab-group assignment.
+///
+/// A tab can render in only one sidebar group, but pane content is per-pane,
+/// so we must pick a single representative pane. The MVP rule is *the focused
+/// pane*: whichever pane currently has focus inside the tab determines the
+/// tab's directory-level group assignment.
+///
+/// Behavior by pane kind:
+///   - Terminal: `pwd_if_local` (deliberately excludes remote/SSH sessions).
+///   - Code: `local_path` (the open file's path; the resolver does
+///     longest-prefix matching against configured directories so e.g.
+///     `~/projects/intavia/crates/app/src/lib.rs` inherits the Intavia
+///     group).
+///   - Other (notebook, workflow, etc.): `None`.
+///
+/// Returning `None` simply makes the tab ungrouped; there is no fallback to
+/// a "last active terminal directory" because no such persisted field exists
+/// today.
+pub fn tab_directory_for_grouping(tab: &TabData, ctx: &AppContext) -> Option<PathBuf> {
+    let pane_group = tab.pane_group.as_ref(ctx);
+    let focused_pane_id = pane_group.focused_pane_id(ctx);
+
+    if let Some(tv) = pane_group.terminal_view_from_pane_id(focused_pane_id, ctx) {
+        return tv.as_ref(ctx).pwd_if_local(ctx).map(PathBuf::from);
+    }
+
+    if let Some(code_view) = pane_group.code_view_from_pane_id(focused_pane_id, ctx) {
+        // Code panes' `local_path` is the open *file* path. For tab grouping
+        // we want the file's containing directory. Assignment keys are
+        // directory-shaped, and `create_tab_group`'s git-root walk expects a
+        // directory to discover from. Without this, group keys land on
+        // individual files and only ever match that one tab.
+        return code_view
+            .as_ref(ctx)
+            .local_path(ctx)
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+    }
+
+    None
+}
+
+/// Returns true when `dir` is too broad to use as a tab-group assignment key.
+///
+/// Concretely: the user's home directory and any of its ancestors (`~`,
+/// `/Users`, `/`, etc.). Default shells start in the home dir, so writing the
+/// home dir (or shallower) as an `InGroup` key would capture every new shell
+/// the user opens, which is the auto-claim foot-gun we want to avoid.
+///
+/// `home.starts_with(dir)` is true iff `dir` is `~` or an ancestor of `~`.
+pub fn is_too_broad_for_group_assignment(dir: &std::path::Path) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let canonical_home = home.canonicalize().unwrap_or(home);
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    canonical_home.starts_with(&canonical_dir)
 }
 
 fn terminal_title_fallback_font(agent_text: &TerminalAgentText) -> TerminalPrimaryLineFont {
@@ -594,6 +655,13 @@ pub(super) struct VerticalTabsPanelState {
     show_pr_link_info_tooltip_mouse_state: MouseStateHandle,
     show_diff_stats_mouse_state: MouseStateHandle,
     show_details_on_hover_mouse_state: MouseStateHandle,
+    /// Hover/click state per tab-group header in the sidebar.
+    /// Lazily populated as groups are rendered.
+    tab_group_header_mouse_states:
+        RefCell<HashMap<crate::workspace::tab_settings::TabGroupId, MouseStateHandle>>,
+    /// Hover/click state for the three-dot button on each group header.
+    tab_group_kebab_mouse_states:
+        RefCell<HashMap<crate::workspace::tab_settings::TabGroupId, MouseStateHandle>>,
     pub(super) show_settings_popup: bool,
 }
 
@@ -629,6 +697,8 @@ impl Default for VerticalTabsPanelState {
             show_pr_link_info_tooltip_mouse_state: Default::default(),
             show_diff_stats_mouse_state: Default::default(),
             show_details_on_hover_mouse_state: Default::default(),
+            tab_group_header_mouse_states: RefCell::default(),
+            tab_group_kebab_mouse_states: RefCell::default(),
             show_settings_popup: false,
         }
     }
@@ -1645,23 +1715,167 @@ fn render_groups(
         groups = groups.with_spacing(TABS_MODE_ITEM_SPACING);
     }
 
-    for (visible_tab_index, (tab_index, filtered_pane_ids)) in visible_tabs.iter().enumerate() {
-        let insert_before_index = *tab_index;
-        let insert_after_index =
-            (visible_tab_index == visible_tabs.len() - 1).then_some(tab_index + 1);
-        groups.add_child(render_tab_group(
-            state,
-            workspace,
-            *tab_index,
-            &workspace.tabs[*tab_index],
-            filtered_pane_ids.as_deref(),
-            TabGroupDragState {
-                is_any_pane_dragging,
-                insert_before_index,
-                insert_after_index,
+    let tab_groups_enabled = FeatureFlag::TabGroups.is_enabled();
+    let tab_groups_value = TabSettings::as_ref(app).tab_groups.value().clone();
+    // We only partition once at least one group exists. With zero groups the
+    // sidebar stays a flat list, preserving current behavior (and drag) for
+    // users who haven't created any groups.
+    let should_partition = tab_groups_enabled && !tab_groups_value.0.is_empty();
+    let query_active = !state.search_query.is_empty();
+
+    if !should_partition {
+        for (visible_tab_index, (tab_index, filtered_pane_ids)) in visible_tabs.iter().enumerate() {
+            let insert_before_index = *tab_index;
+            let insert_after_index =
+                (visible_tab_index == visible_tabs.len() - 1).then_some(tab_index + 1);
+            groups.add_child(render_tab_group(
+                state,
+                workspace,
+                *tab_index,
+                &workspace.tabs[*tab_index],
+                filtered_pane_ids.as_deref(),
+                TabGroupDragState {
+                    is_any_pane_dragging,
+                    insert_before_index,
+                    insert_after_index,
+                },
+                true,
+                app,
+            ));
+        }
+    } else {
+        let assignments = TabSettings::as_ref(app)
+            .tab_group_assignments
+            .value()
+            .clone();
+        let partitioned = grouping::partition_visible_tabs(
+            visible_tabs.clone(),
+            &workspace.tabs,
+            &tab_groups_value,
+            |tab| {
+                tab.tab_group_override.clone().or_else(|| {
+                    tab_directory_for_grouping(tab, app)
+                        .as_deref()
+                        .and_then(|dir| assignments.group_for_directory(dir))
+                })
             },
-            app,
-        ));
+        );
+
+        let total_visible = partitioned
+            .items
+            .iter()
+            .map(|item| match item {
+                grouping::GroupedTabListItem::Ungrouped(_) => 1,
+                grouping::GroupedTabListItem::Group { id, tabs } => {
+                    let Some(group) = tab_groups_value.get(id) else {
+                        return 0;
+                    };
+                    let effective_collapsed = group.collapsed && !query_active;
+                    if effective_collapsed {
+                        0
+                    } else {
+                        tabs.len()
+                    }
+                }
+            })
+            .sum::<usize>();
+        let mut visible_cursor = 0usize;
+
+        for item in &partitioned.items {
+            match item {
+                grouping::GroupedTabListItem::Ungrouped((tab_index, filtered_pane_ids)) => {
+                    visible_cursor += 1;
+                    let insert_before_index = *tab_index;
+                    let insert_after_index =
+                        (visible_cursor == total_visible).then_some(tab_index + 1);
+                    groups.add_child(render_tab_group(
+                        state,
+                        workspace,
+                        *tab_index,
+                        &workspace.tabs[*tab_index],
+                        filtered_pane_ids.as_deref(),
+                        TabGroupDragState {
+                            is_any_pane_dragging,
+                            insert_before_index,
+                            insert_after_index,
+                        },
+                        false,
+                        app,
+                    ));
+                }
+                grouping::GroupedTabListItem::Group {
+                    id: group_id,
+                    tabs: group_tabs,
+                } => {
+                    let Some(group) = tab_groups_value.get(group_id) else {
+                        continue;
+                    };
+                    let header_mouse_state = state
+                        .tab_group_header_mouse_states
+                        .borrow_mut()
+                        .entry(group_id.clone())
+                        .or_default()
+                        .clone();
+                    let kebab_mouse_state = state
+                        .tab_group_kebab_mouse_states
+                        .borrow_mut()
+                        .entry(group_id.clone())
+                        .or_default()
+                        .clone();
+                    // While search is active force the group expanded so matches
+                    // can't get hidden by a saved collapsed state.
+                    let effective_collapsed = group.collapsed && !query_active;
+                    let is_renaming = workspace
+                        .renaming_tab_group()
+                        .map(|id| id == group_id)
+                        .unwrap_or(false);
+                    let header_element = render_tab_group_section_header(
+                        group_id.clone(),
+                        &group.name,
+                        group_tabs.len(),
+                        effective_collapsed,
+                        is_renaming,
+                        header_mouse_state,
+                        kebab_mouse_state,
+                        workspace.tab_group_rename_editor_handle().clone(),
+                        app,
+                    );
+                    groups.add_child(header_element);
+
+                    if effective_collapsed {
+                        continue;
+                    }
+                    for (tab_index, filtered_pane_ids) in group_tabs {
+                        visible_cursor += 1;
+                        let insert_before_index = *tab_index;
+                        let insert_after_index =
+                            (visible_cursor == total_visible).then_some(tab_index + 1);
+                        groups.add_child(render_tab_group(
+                            state,
+                            workspace,
+                            *tab_index,
+                            &workspace.tabs[*tab_index],
+                            filtered_pane_ids.as_deref(),
+                            TabGroupDragState {
+                                is_any_pane_dragging,
+                                insert_before_index,
+                                insert_after_index,
+                            },
+                            false,
+                            app,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Prune hover state for groups that no longer exist.
+        let live_ids: std::collections::HashSet<_> =
+            tab_groups_value.iter().map(|g| g.id.clone()).collect();
+        state
+            .tab_group_header_mouse_states
+            .borrow_mut()
+            .retain(|id, _| live_ids.contains(id));
     }
 
     // Prune stale badge mouse states for panes that no longer exist.
@@ -1693,6 +1907,139 @@ fn render_groups(
     }
 }
 
+/// Position id for the three-dot button on a tab-group header. Used so the
+/// popup menu can anchor itself relative to the button.
+pub(super) fn tab_group_header_kebab_position_id(
+    id: &crate::workspace::tab_settings::TabGroupId,
+) -> String {
+    format!("vertical_tabs:group_header_kebab:{}", id.as_str())
+}
+
+/// Renders the collapsible header row for a single tab group in the sidebar.
+///
+/// Visual structure mirrors `conversation_list::view::render_section_header`
+/// (line 763): chevron + uppercase label, click toggles collapsed. On hover,
+/// a three-dot button surfaces on the right to open the rename / move /
+/// delete popup. While `is_renaming` is true, the title text is replaced
+/// with an inline `TextInput` bound to `rename_editor`.
+fn render_tab_group_section_header(
+    group_id: crate::workspace::tab_settings::TabGroupId,
+    name: &str,
+    count: usize,
+    is_collapsed: bool,
+    is_renaming: bool,
+    mouse_state: MouseStateHandle,
+    kebab_mouse_state: MouseStateHandle,
+    rename_editor: ViewHandle<EditorView>,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let sub_text_color = theme.sub_text_color(theme.background());
+
+    let chevron_icon = if is_collapsed {
+        WarpIcon::ChevronRight
+    } else {
+        WarpIcon::ChevronDown
+    };
+    let chevron = ConstrainedBox::new(chevron_icon.to_warpui_icon(sub_text_color).finish())
+        .with_width(12.)
+        .with_height(12.)
+        .finish();
+
+    // Title region: TextInput while renaming, plain Text otherwise.
+    let title_element: Box<dyn Element> = if is_renaming {
+        TextInput::new(
+            rename_editor,
+            UiComponentStyles::default()
+                .set_background(ElementFill::None)
+                .set_border_radius(CornerRadius::with_all(Radius::Pixels(0.)))
+                .set_border_width(0.),
+        )
+        .build()
+        .finish()
+    } else {
+        Text::new_inline(
+            name.to_string().to_uppercase(),
+            appearance.ui_font_family(),
+            11.,
+        )
+        .with_color(sub_text_color.into())
+        .finish()
+    };
+
+    let count_text = Text::new_inline(format!("{count}"), appearance.ui_font_family(), 11.)
+        .with_color(sub_text_color.into())
+        .finish();
+
+    // Three-dot kebab: surfaces on hover, click opens the header popup menu.
+    let kebab_id_for_click = group_id.clone();
+    let kebab_button = Hoverable::new(kebab_mouse_state, move |btn| {
+        let mut container = Container::new(
+            ConstrainedBox::new(
+                WarpIcon::DotsVertical
+                    .to_warpui_icon(sub_text_color)
+                    .finish(),
+            )
+            .with_width(GROUP_ACTION_BUTTON_ICON_SIZE)
+            .with_height(GROUP_ACTION_BUTTON_ICON_SIZE)
+            .finish(),
+        )
+        .with_padding(Padding::uniform(GROUP_ACTION_BUTTON_PADDING))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+        if btn.is_hovered() {
+            container = container.with_background(internal_colors::fg_overlay_2(theme));
+        }
+        container.finish()
+    })
+    .with_cursor(Cursor::PointingHand)
+    .on_mouse_down(move |ctx, _, position| {
+        ctx.dispatch_typed_action(WorkspaceAction::ToggleTabGroupHeaderMenu {
+            id: kebab_id_for_click.clone(),
+            position,
+        });
+    })
+    .finish();
+    let kebab_button =
+        SavePosition::new(kebab_button, &tab_group_header_kebab_position_id(&group_id)).finish();
+
+    let row = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(6.)
+        .with_child(chevron)
+        .with_child(title_element)
+        .with_child(count_text)
+        .with_child(Expanded::new(1.0, Empty::new().finish()).finish())
+        .with_child(kebab_button)
+        .finish();
+
+    let id_for_click = group_id.clone();
+    let next_collapsed = !is_collapsed;
+    Hoverable::new(mouse_state, move |mouse_state| {
+        let mut container = Container::new(row)
+            .with_horizontal_padding(GROUP_HORIZONTAL_PADDING)
+            .with_vertical_padding(GROUP_HEADER_VERTICAL_PADDING + 2.);
+        if mouse_state.is_hovered() {
+            container = container.with_background(theme.surface_overlay_1());
+        }
+        container.finish()
+    })
+    .with_cursor(Cursor::PointingHand)
+    .with_defer_events_to_children()
+    .on_click(move |ctx, _, _| {
+        // Suppress chevron-toggle while renaming: clicking the editor itself
+        // should focus, not collapse the group.
+        if is_renaming {
+            return;
+        }
+        ctx.dispatch_typed_action(WorkspaceAction::SetTabGroupCollapsed {
+            id: id_for_click.clone(),
+            collapsed: next_collapsed,
+        });
+    })
+    .finish()
+}
+
 fn render_tab_group(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
@@ -1700,6 +2047,7 @@ fn render_tab_group(
     tab: &TabData,
     filtered_pane_ids: Option<&[PaneId]>,
     drag_state: TabGroupDragState,
+    allow_tab_drag: bool,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
@@ -2039,36 +2387,40 @@ fn render_tab_group(
 
     let group_element = group_element.with_defer_events_to_children().finish();
 
-    let draggable = Draggable::new(tab.draggable_state.clone(), group_element)
-        .on_drag_start(|ctx, _, _| {
-            ctx.dispatch_typed_action(WorkspaceAction::StartTabDrag);
-        })
-        .on_drag(move |ctx, _, rect, _| {
-            ctx.dispatch_typed_action(WorkspaceAction::DragTab {
-                tab_index,
-                tab_position: rect,
-            });
-        })
-        .on_drop(|ctx, _, _, _| {
-            ctx.dispatch_typed_action(WorkspaceAction::DropTab);
-        })
-        .with_drag_axis(DragAxis::VerticalOnly)
-        .finish();
+    let tab_element: Box<dyn Element> = if allow_tab_drag {
+        Draggable::new(tab.draggable_state.clone(), group_element)
+            .on_drag_start(|ctx, _, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::StartTabDrag);
+            })
+            .on_drag(move |ctx, _, rect, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::DragTab {
+                    tab_index,
+                    tab_position: rect,
+                });
+            })
+            .on_drop(move |ctx, _, _, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::DropTab);
+            })
+            .with_drag_axis(DragAxis::VerticalOnly)
+            .finish()
+    } else {
+        group_element
+    };
 
-    let draggable: Box<dyn Element> = if is_this_tab_dragging {
-        Container::new(draggable)
+    let tab_element: Box<dyn Element> = if allow_tab_drag && is_this_tab_dragging {
+        Container::new(tab_element)
             .with_background(internal_colors::fg_overlay_1(theme))
             .finish()
     } else {
-        draggable
+        tab_element
     };
-    let draggable = SavePosition::new(draggable, &tab_position_id(tab_index)).finish();
+    let tab_element = SavePosition::new(tab_element, &tab_position_id(tab_index)).finish();
 
-    if is_this_tab_dragging {
-        draggable
+    if allow_tab_drag && is_this_tab_dragging {
+        tab_element
     } else {
         DropTarget::new(
-            draggable,
+            tab_element,
             VerticalTabsPaneDropTargetData {
                 tab_bar_location: TabBarLocation::TabIndex(tab_index),
                 tab_hover_index: TabBarHoverIndex::OverTab(tab_index),

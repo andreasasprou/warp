@@ -229,6 +229,254 @@ impl DirectoryTabColors {
     }
 }
 
+// =====================================================================
+// Tab Groups
+//
+// Two-setting model deliberately split by sync semantics:
+//   - `TabGroups` (cloud-synced) holds *definitions only* (id, name, color,
+//     collapsed). No path data, so it is portable across machines.
+//   - `TabGroupAssignments` (local-only) maps canonical absolute paths to a
+//     group id. Absolute paths are not portable across machines, which is why
+//     `DirectoryTabColors` is `SyncToCloud::Never`; same reasoning here.
+//
+// Assignments are directory-level: every tab whose focused-pane directory has
+// the longest matching prefix in `TabGroupAssignments` lands in the same
+// group. Manual per-tab membership for broad/no-directory tabs is stored on
+// restored workspace tabs instead of in cloud-synced settings.
+// =====================================================================
+
+/// Stable identifier for a tab group.
+///
+/// Stored as a string (UUID v4 generated at creation time). Using a string
+/// keeps the settings/serde derive plumbing simple; `Uuid` itself does not
+/// derive `settings_value::SettingsValue` cleanly through the macros today.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Stable identifier for a tab group.")]
+pub struct TabGroupId(pub String);
+
+impl TabGroupId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for TabGroupId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A single tab-group definition. Cloud-synced; holds no absolute paths.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Definition of a single tab group.")]
+pub struct TabGroup {
+    /// Stable id used by `TabGroupAssignments` to point at this group.
+    pub id: TabGroupId,
+    /// Human-readable name shown in the sidebar header.
+    pub name: String,
+    /// Optional accent color for the group header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<AnsiColorIdentifier>,
+    /// Whether the group is collapsed in the sidebar. Persists across restarts.
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// Ordered list of tab-group definitions. Cloud-synced.
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "User-configured tab groups (definitions only; no path data).")]
+pub struct TabGroups(pub Vec<TabGroup>);
+
+impl TabGroups {
+    pub fn iter(&self) -> std::slice::Iter<'_, TabGroup> {
+        self.0.iter()
+    }
+
+    pub fn get(&self, id: &TabGroupId) -> Option<&TabGroup> {
+        self.0.iter().find(|g| &g.id == id)
+    }
+
+    pub fn contains(&self, id: &TabGroupId) -> bool {
+        self.get(id).is_some()
+    }
+
+    /// Returns a new `TabGroups` with the given group appended.
+    pub fn with_added(&self, group: TabGroup) -> Self {
+        let mut groups = self.0.clone();
+        groups.push(group);
+        Self(groups)
+    }
+
+    /// Returns a new `TabGroups` with the matching group's collapsed flag set.
+    /// If the id is unknown, returns an unchanged clone.
+    pub fn with_collapsed(&self, id: &TabGroupId, collapsed: bool) -> Self {
+        let groups = self
+            .0
+            .iter()
+            .map(|g| {
+                if &g.id == id {
+                    TabGroup {
+                        collapsed,
+                        ..g.clone()
+                    }
+                } else {
+                    g.clone()
+                }
+            })
+            .collect();
+        Self(groups)
+    }
+}
+
+settings::macros::implement_setting_for_enum!(
+    TabGroups,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    private: false,
+    toml_path: "appearance.tabs.tab_groups",
+    description: "User-configured tab groups (definitions only; no path data).",
+    feature_flag: warp_core::features::FeatureFlag::TabGroups,
+);
+
+/// Assignment of a directory to a tab-group state.
+///
+/// `Excluded` is the equivalent of `DirectoryTabColor::Suppressed`, but with
+/// *different shadowing semantics* (see `group_for_directory`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Assignment state for a directory in tab-group settings.",
+    rename_all = "snake_case"
+)]
+pub enum TabGroupAssignment {
+    /// Directory is assigned to a tab group.
+    InGroup(TabGroupId),
+    /// Directory is explicitly excluded and shadows broader `InGroup` matches.
+    Excluded,
+}
+
+/// User-configured directory-to-tab-group assignments.
+///
+/// **Local-only** (`SyncToCloud::Never`). Absolute paths are not portable
+/// across machines, mirroring the rationale for `DirectoryTabColors`.
+///
+/// Resolution is *directory-level*: when two tabs share the same canonical
+/// directory, they will land in the same group unless a tab has local
+/// per-tab membership stored in its workspace snapshot.
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Mapping of directory paths to their tab-group assignments.")]
+pub struct TabGroupAssignments(pub(crate) HashMap<String, TabGroupAssignment>);
+
+settings::macros::implement_setting_for_enum!(
+    TabGroupAssignments,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    private: false,
+    toml_path: "appearance.tabs.tab_group_assignments",
+    max_table_depth: 0,
+    description: "Mapping of directory paths to their tab-group assignments.",
+    feature_flag: warp_core::features::FeatureFlag::TabGroups,
+);
+
+impl TabGroupAssignments {
+    /// Returns the group id (if any) that `dir` resolves to, using
+    /// **longest-prefix-then-interpret** semantics.
+    ///
+    /// Important: this is *not* the same algorithm as
+    /// `DirectoryTabColors::color_for_directory`. The colors lookup filters
+    /// `Suppressed` entries *before* selecting the longest prefix, which means
+    /// a suppressed child cannot shadow a colored parent. Tab groups need the
+    /// opposite: a more-specific `Excluded` *must* shadow a broader `InGroup`
+    /// so users can carve a directory out of an inherited group.
+    pub fn group_for_directory(&self, dir: &Path) -> Option<TabGroupId> {
+        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let winner = self
+            .0
+            .iter()
+            .filter_map(|(configured_path, assignment)| {
+                let configured = Path::new(configured_path);
+                canonical_dir
+                    .starts_with(configured)
+                    .then_some((configured, assignment))
+            })
+            // Longest prefix wins. Tiebreak: lexicographically larger path,
+            // for determinism when two equal-length keys both match.
+            .max_by(|(a_path, _), (b_path, _)| {
+                a_path
+                    .as_os_str()
+                    .len()
+                    .cmp(&b_path.as_os_str().len())
+                    .then_with(|| a_path.as_os_str().cmp(b_path.as_os_str()))
+            });
+
+        match winner {
+            Some((_, TabGroupAssignment::InGroup(id))) => Some(id.clone()),
+            // `Excluded` wins over a broader InGroup, so the tab is ungrouped.
+            Some((_, TabGroupAssignment::Excluded)) => None,
+            None => None,
+        }
+    }
+
+    /// Returns a new value with the given directory's assignment set.
+    pub fn with_assignment(&self, path: &Path, assignment: TabGroupAssignment) -> Self {
+        let mut map = self.0.clone();
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        map.insert(canonical.to_string_lossy().to_string(), assignment);
+        Self(map)
+    }
+}
+
 #[derive(
     Clone,
     Debug,
@@ -539,6 +787,8 @@ define_settings_group!(TabSettings, settings: [
     workspace_decoration_visibility: WorkspaceDecorationVisibility,
     close_button_position: TabCloseButtonPosition,
     directory_tab_colors: DirectoryTabColors,
+    tab_groups: TabGroups,
+    tab_group_assignments: TabGroupAssignments,
 ]);
 
 #[cfg(test)]

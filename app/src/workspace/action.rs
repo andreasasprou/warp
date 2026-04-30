@@ -28,6 +28,7 @@ use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::themes::theme_chooser::ThemeChooserMode;
 use crate::workflows::{WorkflowSelectionSource, WorkflowSource, WorkflowType};
+use crate::workspace::tab_settings::TabGroupId;
 use crate::workspace::PaneViewLocator;
 use session_sharing_protocol::common::SessionId;
 
@@ -256,6 +257,59 @@ pub enum WorkspaceAction {
     },
     DropTab,
     FinalizeDropTab,
+    /// Toggle the collapsed flag on a tab group.
+    SetTabGroupCollapsed {
+        id: TabGroupId,
+        collapsed: bool,
+    },
+    /// Assign a tab to a group. Uses a directory assignment when safe and a
+    /// per-tab workspace override for broad/no-directory tabs.
+    AssignTabDirectoryToGroup {
+        tab_index: usize,
+        group: TabGroupId,
+    },
+    /// Create a new tab group named `name`. If `seed_tab_index` is set, the
+    /// seed tab's safe project directory is written into `TabGroupAssignments`;
+    /// when the seed has no safe project directory, the seed tab gets a
+    /// per-tab workspace override instead.
+    CreateTabGroup {
+        name: String,
+        seed_tab_index: Option<usize>,
+    },
+    /// Remove the tab from grouping. Clears a per-tab override or writes
+    /// `Excluded` for a directory assignment.
+    RemoveTabFromGroup {
+        tab_index: usize,
+    },
+    /// Rename an existing tab group.
+    RenameTabGroup {
+        id: TabGroupId,
+        new_name: String,
+    },
+    /// Reorder a tab group up or down in the sidebar.
+    MoveTabGroupUp {
+        id: TabGroupId,
+    },
+    MoveTabGroupDown {
+        id: TabGroupId,
+    },
+    /// Delete a tab group. Tabs that were in it fall back to ungrouped; the
+    /// reducer also strips matching directory assignments and per-tab
+    /// overrides.
+    DeleteTabGroup {
+        id: TabGroupId,
+    },
+    /// Show or hide the popup menu attached to a tab-group header's
+    /// three-dot button.
+    ToggleTabGroupHeaderMenu {
+        id: TabGroupId,
+        position: Vector2F,
+    },
+    /// Begin inline rename of the tab-group header (focuses the editor and
+    /// pre-fills it with the current name).
+    StartRenameTabGroup {
+        id: TabGroupId,
+    },
     /// Toggles the left panel. In Code Mode V1 this toggles Warp Drive.
     /// In Code Mode V2 this toggles the left panel which contains both the project explorer and
     /// Warp Drive. This happens as explicit action from the user.
@@ -940,6 +994,16 @@ impl WorkspaceAction {
             | TabConfigSidecarRemoveConfig { .. }
             | OpenSettingsFile
             | FixSettingsWithOz { .. }
+            | SetTabGroupCollapsed { .. }
+            | AssignTabDirectoryToGroup { .. }
+            | CreateTabGroup { .. }
+            | RemoveTabFromGroup { .. }
+            | RenameTabGroup { .. }
+            | MoveTabGroupUp { .. }
+            | MoveTabGroupDown { .. }
+            | DeleteTabGroup { .. }
+            | ToggleTabGroupHeaderMenu { .. }
+            | StartRenameTabGroup { .. }
             | OpenNetworkLogPane => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,

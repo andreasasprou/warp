@@ -108,6 +108,7 @@ use crate::terminal::ShellLaunchData;
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::workflows::workflow_enum::{CloudWorkflowEnum, CloudWorkflowEnumModel};
 use crate::workflows::{CloudWorkflow, WorkflowId};
+use crate::workspace::tab_settings::TabGroupId;
 use crate::workspaces::team::Team as TeamMetadata;
 use crate::workspaces::workspace::Workspace as WorkspaceMetadata;
 use crate::workspaces::workspace::WorkspaceUid;
@@ -901,6 +902,10 @@ fn save_app_state(conn: &mut SqliteConnection, app_state: &AppState) -> Result<(
                         SelectedTabColor::Unset => None,
                         _ => serde_yaml::to_string(&tab.selected_color).ok(),
                     },
+                    tab_group_override: tab
+                        .tab_group_override
+                        .as_ref()
+                        .map(|id| id.as_str().to_string()),
                 })
                 .collect();
 
@@ -2710,6 +2715,7 @@ fn read_sqlite_data(
                                     })
                             })
                             .unwrap_or_default(),
+                        tab_group_override: tab.tab_group_override.map(TabGroupId),
                         left_panel,
                         right_panel,
                     })

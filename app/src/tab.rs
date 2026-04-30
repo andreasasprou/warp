@@ -25,7 +25,7 @@ use crate::util::truncation::truncate_from_end;
 
 use crate::window_settings::WindowSettings;
 use crate::workspace::sync_inputs::SyncedInputState;
-use crate::workspace::tab_settings::{TabCloseButtonPosition, TabSettings};
+use crate::workspace::tab_settings::{TabCloseButtonPosition, TabGroupId, TabSettings};
 use crate::workspace::{
     PaneViewLocator, TabBarDropTargetData, TabBarLocation, TabContextMenuAnchor, WorkspaceAction,
 };
@@ -59,6 +59,32 @@ const TAB_INDICATOR_HEIGHT: f32 = 14.0;
 /// menu builders here can share a single predicate.
 pub fn uses_vertical_tabs(ctx: &AppContext) -> bool {
     FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs
+}
+
+/// Auto-names a tab group from its seed tab's git root (preferred) or its
+/// resolved directory's basename. Falls back to "New group" when nothing
+/// resolves or when the resolved key would be too broad to assign safely
+/// (e.g. the user's home dir). The user can rename the group from its
+/// sidebar header menu after creation.
+pub(crate) fn default_group_name_for_seed(tab: &TabData, ctx: &AppContext) -> String {
+    let Some(dir) = crate::workspace::view::vertical_tabs::tab_directory_for_grouping(tab, ctx)
+    else {
+        return "New group".to_string();
+    };
+    let key = git2::Repository::discover(&dir)
+        .ok()
+        .and_then(|repo| repo.workdir().map(std::path::Path::to_path_buf))
+        .unwrap_or(dir);
+    if crate::workspace::view::vertical_tabs::is_too_broad_for_group_assignment(&key) {
+        // Don't surface "andreasasprou" / "Users" / "" as a group name. Those
+        // come from naming a group after the home dir or shallower, which we
+        // also refuse to write as an assignment key.
+        return "New group".to_string();
+    }
+    key.file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "New group".to_string())
 }
 
 const WARP_2_TAB_COLOR_OPACITY: Opacity = 25;
@@ -141,6 +167,10 @@ pub struct TabData {
     pub default_directory_color: Option<AnsiColorIdentifier>,
     /// Color chosen manually by the user (e.g. right-click menu).
     pub selected_color: SelectedTabColor,
+    /// Manual tab-group membership for tabs that should not use the
+    /// directory-level assignment map. This is persisted in the workspace
+    /// snapshot, not cloud-synced settings.
+    pub tab_group_override: Option<TabGroupId>,
     pub indicator_hover_state: MouseStateHandle,
     // Used by a later drag-tab branch to distinguish tabs that have moved into detached windows.
     pub detached: bool,
@@ -159,6 +189,7 @@ impl TabData {
             draggable_state: Default::default(),
             default_directory_color: None,
             selected_color: SelectedTabColor::Unset,
+            tab_group_override: None,
             indicator_hover_state: Default::default(),
             detached: false,
         }
@@ -193,6 +224,7 @@ impl TabData {
         for section_items in [
             self.session_sharing_menu_items(index, ctx),
             self.modify_tab_menu_items(index, tabs_len, pane_name_target, ctx),
+            self.tab_group_menu_items(index, ctx),
             self.close_tab_menu_items(index, tabs_len, ctx),
             Self::save_config_menu_items(index),
             self.color_option_menu_items(index, terminal_colors),
@@ -340,6 +372,78 @@ impl TabData {
             );
         }
         menu_items
+    }
+
+    /// Builds the "Tab groups" section of the right-click context menu.
+    ///
+    /// Empty (returns `vec![]`) when `FeatureFlag::TabGroups` is disabled, so
+    /// the broader menu structure is unchanged for users who don't have the
+    /// feature.
+    ///
+    /// Safe project tabs use directory-level assignment; broad/no-directory
+    /// tabs use per-tab workspace membership.
+    fn tab_group_menu_items(
+        &self,
+        index: usize,
+        ctx: &AppContext,
+    ) -> Vec<MenuItem<WorkspaceAction>> {
+        if !FeatureFlag::TabGroups.is_enabled() {
+            return vec![];
+        }
+
+        let tab_settings = TabSettings::as_ref(ctx);
+        let groups = tab_settings.tab_groups.value().clone();
+        let current_group_id = self.tab_group_override.clone().or_else(|| {
+            crate::workspace::view::vertical_tabs::tab_directory_for_grouping(self, ctx)
+                .as_deref()
+                .and_then(|dir| {
+                    tab_settings
+                        .tab_group_assignments
+                        .value()
+                        .group_for_directory(dir)
+                })
+        });
+        let current_group_id = current_group_id.filter(|id| groups.contains(id));
+
+        let mut items: Vec<MenuItem<WorkspaceAction>> = vec![];
+
+        items.push(
+            MenuItemFields::new("New group from this tab")
+                .with_on_select_action(WorkspaceAction::CreateTabGroup {
+                    name: default_group_name_for_seed(self, ctx),
+                    seed_tab_index: Some(index),
+                })
+                .into_item(),
+        );
+
+        for group in groups.iter() {
+            if current_group_id.as_ref() == Some(&group.id) {
+                continue;
+            }
+
+            let group_id = group.id.clone();
+            items.push(
+                MenuItemFields::new(format!("Move to \"{}\"", group.name))
+                    .with_on_select_action(WorkspaceAction::AssignTabDirectoryToGroup {
+                        tab_index: index,
+                        group: group_id,
+                    })
+                    .into_item(),
+            );
+        }
+
+        // "Remove from group" clears per-tab membership first; otherwise it
+        // writes an Excluded entry only when the tab's directory currently
+        // resolves to a group.
+        if current_group_id.is_some() {
+            items.push(
+                MenuItemFields::new("Remove from group")
+                    .with_on_select_action(WorkspaceAction::RemoveTabFromGroup { tab_index: index })
+                    .into_item(),
+            );
+        }
+
+        items
     }
 
     fn pane_name_menu_items(

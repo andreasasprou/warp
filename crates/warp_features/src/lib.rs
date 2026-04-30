@@ -746,6 +746,11 @@ pub enum FeatureFlag {
     /// adopt the configured color when their working directory matches.
     DirectoryTabColors,
 
+    /// Enables collapsible per-project tab groups in the vertical tabs sidebar.
+    /// Group definitions sync across machines; directory-to-group assignments are
+    /// local-only because absolute paths are not portable.
+    TabGroups,
+
     /// Enables the new settings to control visibility of Warp Drive, Code Review Panel,
     /// and Project Explorer & Global Search features.
     OpenWarpNewSettingsModes,
@@ -906,6 +911,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::CodebaseIndexSpeedbump,
     // End manually enabled Code features.
     FeatureFlag::DirectoryTabColors,
+    FeatureFlag::TabGroups,
     FeatureFlag::EditableMarkdownMermaid,
     FeatureFlag::CodeReviewScrollPreservation,
     FeatureFlag::OzIdentityFederation,
