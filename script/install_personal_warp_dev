@@ -7,7 +7,8 @@
 #   app name:     WarpDev
 #   data dir:     ~/.warp-dev
 #
-# The installed app can be replaced repeatedly while ~/.warp-dev remains intact.
+# The installed app can be replaced repeatedly while ~/.warp-dev and the dev
+# channel state directories remain intact.
 
 set -euo pipefail
 
@@ -17,8 +18,12 @@ Usage:
   ./script/install_personal_warp_dev [options]
 
 Options:
-  --copy-stable-data   One-time seed: replace ~/.warp-dev with a copy of ~/.warp.
+  --copy-stable-data   One-time seed from Stable Warp into WarpDev data dirs.
+                       Copies sessions/state plus lightweight config. Excludes
+                       ~/.warp/worktrees unless --copy-worktrees is also set.
+  --copy-worktrees     With --copy-stable-data, also copy ~/.warp/worktrees.
   --open               Open the installed app after copying it into place.
+  --open-stable        Also reopen /Applications/Warp.app after install.
   --debug              Build a debug bundle instead of the default dev release profile.
   --dest PATH          Install location. Default: ~/Applications/Warp-Dev.app.
   --features LIST      Extra comma-separated Cargo features. Default: tab_groups.
@@ -26,7 +31,7 @@ Options:
   -h, --help           Show this help.
 
 Examples:
-  ./script/install_personal_warp_dev --copy-stable-data --open
+  ./script/install_personal_warp_dev --copy-stable-data --open --open-stable
   ./script/install_personal_warp_dev --open
   ./script/install_personal_warp_dev --features tab_groups,my_other_feature --open
 EOF
@@ -38,7 +43,9 @@ cd "$repo_root"
 dest="$HOME/Applications/Warp-Dev.app"
 features="${WARP_PERSONAL_FEATURES:-tab_groups}"
 copy_stable_data=false
+copy_worktrees=false
 open_after=false
+open_stable_after=false
 debug=false
 skip_build=false
 
@@ -48,8 +55,16 @@ while (($#)); do
       copy_stable_data=true
       shift
       ;;
+    --copy-worktrees)
+      copy_worktrees=true
+      shift
+      ;;
     --open)
       open_after=true
+      shift
+      ;;
+    --open-stable)
+      open_stable_after=true
       shift
       ;;
     --debug)
@@ -101,11 +116,40 @@ fi
 built_app="$repo_root/target/$profile_dir/bundle/osx/WarpDev.app"
 stable_data="$HOME/.warp"
 dev_data="$HOME/.warp-dev"
+app_support="$HOME/Library/Application Support"
+stable_app_support="$app_support/dev.warp.Warp-Stable"
+dev_app_support="$app_support/dev.warp.Warp-Dev"
+group_support="$HOME/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support"
+stable_group_support="$group_support/dev.warp.Warp-Stable"
+dev_group_support="$group_support/dev.warp.Warp-Dev"
 timestamp="$(date +%Y%m%d-%H%M%S)"
 
 quit_app() {
   local bundle_id="$1"
   osascript -e "tell application id \"$bundle_id\" to quit" >/dev/null 2>&1 || true
+}
+
+backup_if_exists() {
+  local path="$1"
+  if [[ -e "$path" || -L "$path" ]]; then
+    local backup="$path.backup.$timestamp"
+    echo "Backing up $path to $backup"
+    mv "$path" "$backup"
+  fi
+}
+
+copy_tree() {
+  local source="$1"
+  local dest="$2"
+  shift 2
+
+  if [[ ! -d "$source" ]]; then
+    echo "Skipping missing source: $source"
+    return
+  fi
+
+  mkdir -p "$dest"
+  rsync -a --delete "$@" "$source"/ "$dest"/
 }
 
 if [[ "$copy_stable_data" == true ]]; then
@@ -119,14 +163,23 @@ if [[ "$copy_stable_data" == true ]]; then
     exit 1
   fi
 
-  if [[ -e "$dev_data" || -L "$dev_data" ]]; then
-    backup="$dev_data.backup.$timestamp"
-    echo "Backing up existing dev data to $backup"
-    mv "$dev_data" "$backup"
+  backup_if_exists "$dev_data"
+  backup_if_exists "$dev_group_support"
+  backup_if_exists "$dev_app_support"
+
+  portable_excludes=()
+  if [[ "$copy_worktrees" != true ]]; then
+    portable_excludes+=(--exclude worktrees)
   fi
 
-  echo "Copying $stable_data to $dev_data"
-  ditto "$stable_data" "$dev_data"
+  echo "Copying portable config $stable_data to $dev_data"
+  copy_tree "$stable_data" "$dev_data" "${portable_excludes[@]}"
+
+  echo "Copying secure state $stable_group_support to $dev_group_support"
+  copy_tree "$stable_group_support" "$dev_group_support"
+
+  echo "Copying app support state $stable_app_support to $dev_app_support"
+  copy_tree "$stable_app_support" "$dev_app_support"
 else
   quit_app "dev.warp.Warp-Dev"
 fi
@@ -162,4 +215,8 @@ echo "Persistent data directory: $dev_data"
 
 if [[ "$open_after" == true ]]; then
   open "$dest"
+fi
+
+if [[ "$open_stable_after" == true ]]; then
+  open "/Applications/Warp.app"
 fi
