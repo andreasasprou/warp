@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+#
+# Build the current checkout as a persistent personal WarpDev app.
+#
+# This intentionally uses Warp's existing dev channel:
+#   app identity: dev.warp.Warp-Dev
+#   app name:     WarpDev
+#   data dir:     ~/.warp-dev
+#
+# The installed app can be replaced repeatedly while ~/.warp-dev remains intact.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./script/install_personal_warp_dev [options]
+
+Options:
+  --copy-stable-data   One-time seed: replace ~/.warp-dev with a copy of ~/.warp.
+  --open               Open the installed app after copying it into place.
+  --debug              Build a debug bundle instead of the default dev release profile.
+  --dest PATH          Install location. Default: ~/Applications/Warp-Dev.app.
+  --features LIST      Extra comma-separated Cargo features. Default: tab_groups.
+  --skip-build         Reinstall the last built WarpDev.app without rebuilding.
+  -h, --help           Show this help.
+
+Examples:
+  ./script/install_personal_warp_dev --copy-stable-data --open
+  ./script/install_personal_warp_dev --open
+  ./script/install_personal_warp_dev --features tab_groups,my_other_feature --open
+EOF
+}
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+dest="$HOME/Applications/Warp-Dev.app"
+features="${WARP_PERSONAL_FEATURES:-tab_groups}"
+copy_stable_data=false
+open_after=false
+debug=false
+skip_build=false
+
+while (($#)); do
+  case "$1" in
+    --copy-stable-data)
+      copy_stable_data=true
+      shift
+      ;;
+    --open)
+      open_after=true
+      shift
+      ;;
+    --debug)
+      debug=true
+      shift
+      ;;
+    --dest)
+      if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+        echo "error: --dest requires a path" >&2
+        exit 1
+      fi
+      dest="$2"
+      shift 2
+      ;;
+    --features)
+      if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+        echo "error: --features requires a comma-separated feature list" >&2
+        exit 1
+      fi
+      features="$2"
+      shift 2
+      ;;
+    --skip-build)
+      skip_build=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+profile_dir="release-lto-debug_assertions"
+bundle_args=(--channel dev --features "$features" --nouniversal --selfsign)
+if [[ "$debug" == true ]]; then
+  profile_dir="debug"
+  bundle_args+=(--debug)
+fi
+if [[ "$skip_build" == true ]]; then
+  bundle_args+=(--skip-build)
+fi
+
+built_app="$repo_root/target/$profile_dir/bundle/osx/WarpDev.app"
+stable_data="$HOME/.warp"
+dev_data="$HOME/.warp-dev"
+timestamp="$(date +%Y%m%d-%H%M%S)"
+
+quit_app() {
+  local bundle_id="$1"
+  osascript -e "tell application id \"$bundle_id\" to quit" >/dev/null 2>&1 || true
+}
+
+if [[ "$copy_stable_data" == true ]]; then
+  echo "Quitting Warp and WarpDev before copying data."
+  quit_app "dev.warp.Warp-Stable"
+  quit_app "dev.warp.Warp-Dev"
+  sleep 1
+
+  if [[ ! -d "$stable_data" ]]; then
+    echo "error: cannot copy stable data because $stable_data does not exist" >&2
+    exit 1
+  fi
+
+  if [[ -e "$dev_data" || -L "$dev_data" ]]; then
+    backup="$dev_data.backup.$timestamp"
+    echo "Backing up existing dev data to $backup"
+    mv "$dev_data" "$backup"
+  fi
+
+  echo "Copying $stable_data to $dev_data"
+  ditto "$stable_data" "$dev_data"
+else
+  quit_app "dev.warp.Warp-Dev"
+fi
+
+if [[ "$skip_build" != true ]]; then
+  if ! command -v warp-channel-config >/dev/null 2>&1; then
+    echo "error: warp-channel-config is required for bundled internal-channel builds." >&2
+    echo "Run ./script/install_channel_config, then retry." >&2
+    exit 1
+  fi
+fi
+
+echo "Bundling WarpDev with features: $features"
+./script/bundle "${bundle_args[@]}"
+
+if [[ ! -d "$built_app" ]]; then
+  echo "error: expected built app at $built_app" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$dest")"
+tmp_dest="$dest.tmp.$timestamp"
+rm -rf "$tmp_dest"
+
+echo "Installing $built_app to $dest"
+ditto "$built_app" "$tmp_dest"
+rm -rf "$dest"
+mv "$tmp_dest" "$dest"
+xattr -dr com.apple.quarantine "$dest" >/dev/null 2>&1 || true
+
+echo "Installed personal WarpDev app: $dest"
+echo "Persistent data directory: $dev_data"
+
+if [[ "$open_after" == true ]]; then
+  open "$dest"
+fi
