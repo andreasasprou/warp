@@ -22,6 +22,8 @@ Options:
                        Copies sessions/state plus lightweight config. Excludes
                        ~/.warp/worktrees unless --copy-worktrees is also set.
   --copy-worktrees     With --copy-stable-data, also copy ~/.warp/worktrees.
+  --keep-stable-open   With --copy-stable-data, do not quit Stable Warp. Uses
+                       SQLite online backup for the session DB.
   --open               Open the installed app after copying it into place.
   --open-stable        Also reopen /Applications/Warp.app after install.
   --debug              Build a debug bundle instead of the default dev release profile.
@@ -32,7 +34,7 @@ Options:
   -h, --help           Show this help.
 
 Examples:
-  ./script/install_personal_warp_dev --copy-stable-data --open --open-stable
+  ./script/install_personal_warp_dev --copy-stable-data --keep-stable-open --open
   ./script/install_personal_warp_dev --open
   ./script/install_personal_warp_dev --features tab_groups,my_other_feature --open
 EOF
@@ -45,6 +47,7 @@ dest="$HOME/Applications/Warp-Dev.app"
 features="${WARP_PERSONAL_FEATURES:-tab_groups,personal_dev_config}"
 copy_stable_data=false
 copy_worktrees=false
+keep_stable_open=false
 open_after=false
 open_stable_after=false
 debug=false
@@ -58,6 +61,10 @@ while (($#)); do
       ;;
     --copy-worktrees)
       copy_worktrees=true
+      shift
+      ;;
+    --keep-stable-open)
+      keep_stable_open=true
       shift
       ;;
     --open)
@@ -153,9 +160,42 @@ copy_tree() {
   rsync -a --delete "$@" "$source"/ "$dest"/
 }
 
+copy_group_state() {
+  if [[ ! -d "$stable_group_support" ]]; then
+    echo "Skipping missing source: $stable_group_support"
+    return
+  fi
+
+  mkdir -p "$dev_group_support"
+
+  if [[ "$keep_stable_open" == true && -f "$stable_group_support/warp.sqlite" ]]; then
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+      echo "error: sqlite3 is required for --keep-stable-open data seeding" >&2
+      exit 1
+    fi
+
+    echo "Copying secure state without raw SQLite WAL files"
+    rsync -a --delete \
+      --exclude 'warp.sqlite' \
+      --exclude 'warp.sqlite-shm' \
+      --exclude 'warp.sqlite-wal' \
+      "$stable_group_support"/ "$dev_group_support"/
+
+    echo "Backing up live Stable SQLite database into WarpDev state"
+    sqlite3 "$stable_group_support/warp.sqlite" ".backup '$dev_group_support/warp.sqlite'"
+  else
+    copy_tree "$stable_group_support" "$dev_group_support"
+  fi
+}
+
 if [[ "$copy_stable_data" == true ]]; then
-  echo "Quitting Warp and WarpDev before copying data."
-  quit_app "dev.warp.Warp-Stable"
+  if [[ "$keep_stable_open" == true ]]; then
+    echo "Keeping Stable Warp open; using live-safe copy for SQLite state."
+  else
+    echo "Quitting Stable Warp before copying data."
+    quit_app "dev.warp.Warp-Stable"
+  fi
+  echo "Quitting WarpDev before copying data."
   quit_app "dev.warp.Warp-Dev"
   sleep 1
 
@@ -177,7 +217,7 @@ if [[ "$copy_stable_data" == true ]]; then
   copy_tree "$stable_data" "$dev_data" "${portable_excludes[@]}"
 
   echo "Copying secure state $stable_group_support to $dev_group_support"
-  copy_tree "$stable_group_support" "$dev_group_support"
+  copy_group_state
 
   echo "Copying app support state $stable_app_support to $dev_app_support"
   copy_tree "$stable_app_support" "$dev_app_support"
