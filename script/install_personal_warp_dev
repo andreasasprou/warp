@@ -26,7 +26,8 @@ Options:
   --open-stable        Also reopen /Applications/Warp.app after install.
   --debug              Build a debug bundle instead of the default dev release profile.
   --dest PATH          Install location. Default: ~/Applications/Warp-Dev.app.
-  --features LIST      Extra comma-separated Cargo features. Default: tab_groups.
+  --features LIST      Extra comma-separated Cargo features.
+                       Default: tab_groups,personal_dev_config.
   --skip-build         Reinstall the last built WarpDev.app without rebuilding.
   -h, --help           Show this help.
 
@@ -41,7 +42,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 dest="$HOME/Applications/Warp-Dev.app"
-features="${WARP_PERSONAL_FEATURES:-tab_groups}"
+features="${WARP_PERSONAL_FEATURES:-tab_groups,personal_dev_config}"
 copy_stable_data=false
 copy_worktrees=false
 open_after=false
@@ -182,14 +183,6 @@ if [[ "$copy_stable_data" == true ]]; then
   copy_tree "$stable_app_support" "$dev_app_support"
 else
   quit_app "dev.warp.Warp-Dev"
-fi
-
-if [[ "$skip_build" != true ]]; then
-  if ! command -v warp-channel-config >/dev/null 2>&1; then
-    echo "error: warp-channel-config is required for bundled internal-channel builds." >&2
-    echo "Run ./script/install_channel_config, then retry." >&2
-    exit 1
-  fi
 fi
 
 echo "Bundling WarpDev with features: $features"
